@@ -27,7 +27,8 @@ from typing import (
 
 import numpy as np
 from numpy.typing import NBitBase, NDArray
-
+import pygtrie
+from pygtrie import CharTrie
 from .alphabet import BPE_TOKEN, Alphabet, verify_alphabet_coverage
 from .constants import (
     DEFAULT_ALPHA,
@@ -162,9 +163,9 @@ def _normalize_whitespace(text: str) -> str:
     return " ".join(text.split())
 
 
-def _sort_and_trim_beams(beams: List[LMBeam], beam_width: int) -> List[LMBeam]:
+def _sort_and_trim_beams(beams: List[Beam], beam_width: int, logit_score = False) -> List[Beam]:
     """Take top N beams by score."""
-    return heapq.nlargest(beam_width, beams, key=lambda x: x.lm_score)
+    return heapq.nlargest(beam_width, beams, key=lambda x: x.logit_score if logit_score else x.lm_score)
 
 
 def _sum_log_scores(s1: float, s2: float) -> float:
@@ -276,16 +277,21 @@ class BeamSearchDecoderCTC:
         self,
         alphabet: Alphabet,
         language_model: Optional[AbstractLanguageModel] = None,
+        rules: Optional[Dict[str, Any]] = None,
     ) -> None:
         """CTC beam search decoder for token logit matrix.
 
         Args:
             alphabet: class containing the labels for input logit matrices
             language_model: convenience class to store language model functionality
+            rules: dictionary of rules to match against the text, where key is the rule
+            and value is the value to return if the rule matches.
         """
         self._alphabet = alphabet
         self._idx2vocab = {n: c for n, c in enumerate(self._alphabet.labels)}
         self._is_bpe = alphabet.is_bpe
+        self._rules = rules
+        self._rule_trie = CharTrie.fromkeys(rules.keys(), 1) if rules else None
         self._model_key = os.urandom(16)
         BeamSearchDecoderCTC.model_container[self._model_key] = language_model
 
@@ -436,6 +442,7 @@ class BeamSearchDecoderCTC:
         cached_p_lm_scores: Dict[str, float],
         processed_frames: int = 0,
     ) -> List[Beam]:
+        # rule_match_mode = bool(self._rules)
         """Decode logits for a set of beams with warmed score caches."""
         language_model = self._language_model
         # bpe we can also have trailing word boundaries ▁⁇▁ so we may need to remember breaks
@@ -480,6 +487,9 @@ class BeamSearchDecoderCTC:
                         if char[-1:] == BPE_TOKEN:
                             clean_char = clean_char[:-1]
                             force_next_break = True
+                        # rule_following = beam.text + (' ' if beam.text else '') + beam.partial_word + (' ' if beam.partial_word and char[:1] == BPE_TOKEN else '') + clean_char
+                        # if rule_match_mode and not self._rule_trie.has_node(rule_following):
+                        #     continue
                         new_frame_list = (
                             beam.text_frames
                             if beam.partial_word == ""
@@ -516,6 +526,9 @@ class BeamSearchDecoderCTC:
                         )
                     # general update of continuing token without space
                     else:
+                        # rule_following = beam.text + (' ' if beam.text else '') + beam.partial_word + char
+                        # if rule_match_mode and not self._rule_trie.has_node(rule_following):
+                        #     continue
                         new_part_frames = (
                             (frame_idx, frame_idx + 1)
                             if beam.partial_frames[0] < 0
@@ -532,7 +545,8 @@ class BeamSearchDecoderCTC:
                                 beam.logit_score + p_char,
                             )
                         )
-
+            # if rule_match_mode and not new_beams:
+            #     return None  # no new beams matched the rules, so we stop decoding
             # lm scoring and beam pruning
             new_beams = _merge_beams(new_beams)
             scored_beams = self._get_lm_beams(
@@ -554,6 +568,154 @@ class BeamSearchDecoderCTC:
                 beams = [Beam.from_lm_beam(b) for b in trimmed_beams]
 
         return beams
+    
+    def _check_rule_match(self, rule_following: str) -> Optional[List[Beam]]:
+        ''' Check if the string tracking the decoding matches any of the rules.
+        If it matches a rule, return the rule and the corresponding value.'''
+        has_node = self._rule_trie.has_node(rule_following)
+        if not has_node:
+            return None
+        elif has_node & pygtrie.Trie.HAS_VALUE:
+            return rule_following, self._rules.get(rule_following, None)
+        else:
+            # if rule is not a leaf node, we can continue decoding
+            return False
+        
+    def decode_rules(
+        self,
+        logits: NDArray[NpFloat],
+        beam_width: int,
+        beam_prune_logp: float = DEFAULT_PRUNE_LOGP,
+        token_min_logp: float = DEFAULT_MIN_TOKEN_LOGP * 3,
+        processed_frames: int = 0,
+    ) -> List[Beam]:
+        # bpe we can also have trailing word boundaries ▁⁇▁ so we may need to remember breaks
+        beams = [EMPTY_START_BEAM]
+        force_next_break = False
+        for frame_idx, logit_col in enumerate(logits, start=processed_frames):
+            max_idx = logit_col.argmax()
+            idx_list = set(np.where(logit_col >= token_min_logp)[0]) | {max_idx}
+            new_beams: List[Beam] = []
+            for idx_char in idx_list:
+                p_char = logit_col[idx_char]
+                char = self._idx2vocab[idx_char]
+                for beam in beams:
+                    # if only blank token or same token
+                    if char == "" or beam.last_char == char:
+                        if char == "":
+                            new_end_frame = beam.partial_frames[0]
+                        else:
+                            new_end_frame = frame_idx + 1
+                        new_part_frames = (
+                            beam.partial_frames
+                            if char == ""
+                            else (beam.partial_frames[0], new_end_frame)
+                        )
+                        new_beams.append(
+                            Beam(
+                                text=beam.text,
+                                next_word=beam.next_word,
+                                partial_word=beam.partial_word,
+                                last_char=char,
+                                text_frames=beam.text_frames,
+                                partial_frames=new_part_frames,
+                                logit_score=beam.logit_score + p_char,
+                            )
+                        )
+                    # if bpe and leading space char
+                    elif self._is_bpe and (char[:1] == BPE_TOKEN or force_next_break):
+                        force_next_break = False
+                        # some tokens are bounded on both sides like ▁⁇▁
+                        clean_char = char
+                        if char[:1] == BPE_TOKEN:
+                            clean_char = clean_char[1:]
+                        if char[-1:] == BPE_TOKEN:
+                            clean_char = clean_char[:-1]
+                            force_next_break = True
+                        rule_following = beam.text + (' ' if beam.text else '') + beam.partial_word + (' ' if beam.partial_word and char[:1] == BPE_TOKEN else '') + clean_char
+                        match = self._check_rule_match(rule_following)
+                        if match is None:
+                            continue
+                        elif match:
+                            return match
+                        new_frame_list = (
+                            beam.text_frames
+                            if beam.partial_word == ""
+                            else beam.text_frames + [beam.partial_frames]
+                        )
+                        new_beams.append(
+                            Beam(
+                                text=beam.text,
+                                next_word=beam.partial_word,
+                                partial_word=clean_char,
+                                last_char=char,
+                                text_frames=new_frame_list,
+                                partial_frames=(frame_idx, frame_idx + 1),
+                                logit_score=beam.logit_score + p_char,
+                            )
+                        )
+                    # if not bpe and space char
+                    elif not self._is_bpe and char == " ":
+                        new_frame_list = (
+                            beam.text_frames
+                            if beam.partial_word == ""
+                            else beam.text_frames + [beam.partial_frames]
+                        )
+                        new_beams.append(
+                            Beam(
+                                text=beam.text,
+                                next_word=beam.partial_word,
+                                partial_word="",
+                                last_char=char,
+                                text_frames=new_frame_list,
+                                partial_frames=NULL_FRAMES,
+                                logit_score=beam.logit_score + p_char,
+                            )
+                        )
+                    # general update of continuing token without space
+                    else:
+                        rule_following = beam.text + (' ' if beam.text else '') + beam.partial_word + char
+                        match = self._check_rule_match(rule_following)
+                        if match is None:
+                            continue
+                        elif match:
+                            return match
+                        new_part_frames = (
+                            (frame_idx, frame_idx + 1)
+                            if beam.partial_frames[0] < 0
+                            else (beam.partial_frames[0], frame_idx + 1)
+                        )
+                        new_beams.append(
+                            Beam(
+                                beam.text,
+                                beam.next_word,
+                                beam.partial_word + char,
+                                char,
+                                beam.text_frames,
+                                new_part_frames,
+                                beam.logit_score + p_char,
+                            )
+                        )
+            if not new_beams:
+                return None  # no new beams matched the rules, so we stop decoding
+            # lm scoring and beam pruning
+            new_beams = [Beam(
+                    text=_merge_tokens(beam.text, beam.next_word),
+                    next_word="",
+                    partial_word=beam.partial_word,
+                    last_char=beam.last_char,
+                    text_frames=beam.text_frames,
+                    partial_frames=beam.partial_frames,
+                    logit_score=beam.logit_score,
+                ) for beam in new_beams]
+            new_beams = _merge_beams(new_beams)
+            # remove beam outliers
+            max_score = max([b.logit_score for b in new_beams])
+            scored_beams = [b for b in new_beams if b.logit_score >= max_score + beam_prune_logp]
+            # beam pruning by taking highest N prefixes and then filtering down
+            beams = _sort_and_trim_beams(scored_beams, beam_width, logit_score=True)
+
+        return None
 
     def _finalize_beams(
         self,
@@ -567,6 +729,8 @@ class BeamSearchDecoderCTC:
         is_end: bool = False,
     ) -> List[LMBeam]:
         """Perform final language model scoring and sorting."""
+        if beams is None or len(beams) == 0:
+            return []
         if force_next_word or is_end:
             new_beams = []
             for beam in beams:
@@ -1056,6 +1220,7 @@ def build_ctcdecoder(
     beta: float = DEFAULT_BETA,
     unk_score_offset: float = DEFAULT_UNK_LOGP_OFFSET,
     lm_score_boundary: bool = DEFAULT_SCORE_LM_BOUNDARY,
+    rules: Optional[Dict[str, Any]] = None,
 ) -> BeamSearchDecoderCTC:
     """Build a BeamSearchDecoderCTC instance with main functionality.
 
@@ -1096,4 +1261,4 @@ def build_ctcdecoder(
         )
     else:
         language_model = None
-    return BeamSearchDecoderCTC(alphabet, language_model)
+    return BeamSearchDecoderCTC(alphabet, language_model, rules=rules)
